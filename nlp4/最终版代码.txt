@@ -1,0 +1,348 @@
+import math
+import time
+from sklearn.metrics import precision_score
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+from glove import Glove
+from glove import Corpus
+trainX=[]
+trainY=[]
+checkX=[]
+checkY=[]
+testX=[]
+testY=[]
+sentense = [["19260817"],["</start/>"],["</end/>"]]
+dict={}
+name={}
+tot=3
+dict["</start/>"]=0
+dict["</end/>"]=1
+dict["19260817"]=2
+START = 0
+END = 1
+fg=0
+maxlen=0
+#思考一个问题，就是我们究竟是需要把后面填成end还是19260817
+for f in open('drive/train.in'):
+    if (fg&1) == 0:
+        a = f.split()
+        a = [x.lower() for x in a if isinstance(x, str)]
+        maxlen = max(maxlen,len(a))
+        sentense.append(a)
+        trainX.append(a)
+    else:
+        a = f.split()
+        for i in range(len(a)):
+            if dict.get(a[i]) is None:
+                dict[a[i]] = tot
+                tot += 1
+            a[i]=dict[a[i]]
+        trainY.append(a)
+    fg+=1
+fg=0
+for f in open('drive/dev.in'):
+    if (fg & 1) == 0:
+        a = f.split()
+        a = [x.lower() for x in a if isinstance(x, str)]
+        maxlen = max(maxlen, len(a))
+        sentense.append(a)
+        checkX.append(a)
+    else:
+        a = f.split()
+        for i in range(len(a)):
+            if dict.get(a[i]) is None:
+                dict[a[i]] = tot
+                tot += 1
+            a[i]=dict[a[i]]
+        checkY.append(a)
+    fg += 1
+fg=0
+for f in open('drive/test.in'):
+    if (fg & 1) == 0:
+        a = f.split()
+        a = [x.lower() for x in a if isinstance(x, str)]
+        maxlen = max(maxlen, len(a))
+        sentense.append(a)
+        testX.append(a)
+    else:
+        a = f.split()
+        for i in range(len(a)):
+            if dict.get(a[i]) is None:
+                dict[a[i]] = tot
+                tot += 1
+            a[i]=dict[a[i]]
+        testY.append(a)
+    fg += 1
+for k in dict.keys() :
+    name[dict[k]]=k
+print(len(testX)," ",len(testY))
+embedding_dim = 300
+hidden_size = 300
+batch_size = 100
+tag_size=len(dict)
+corpus_model = Corpus()
+corpus_model.fit(sentense, window=10)
+dict_size=len(corpus_model.dictionary)
+print('Dict size: %s' % len(corpus_model.dictionary))
+print('Collocations: %s' % corpus_model.matrix.nnz)
+print("tah_size: ",tag_size)
+glove = Glove(no_components=embedding_dim, learning_rate=0.05)
+glove.fit(corpus_model.matrix, epochs=20,no_threads=8, verbose=True)
+glove.add_dictionary(corpus_model.dictionary)
+
+def get(X,Y,maxlen):
+    tmpX = np.zeros((len(X),maxlen), dtype=int)
+    tmpY = np.zeros((len(Y), maxlen), dtype=int)
+    for i in range(len(X)):
+        while len(X[i]) < maxlen:
+            X[i].append("19260817")
+        for j in range(len(X[i])):
+            tmpX[i][j]=glove.dictionary[X[i][j]]
+            #print(X[i][j])
+            #print(tmpX[i][j])
+    for i in range(len(Y)):
+        while len(Y[i]) < maxlen:
+            Y[i].append(dict["19260817"])
+        tmpY[i]=Y[i]
+    return tmpX,tmpY
+
+class Sentence(Dataset):
+    def __init__(self, x, y=None):
+        self.x = torch.LongTensor(x)
+        self.y = y
+        if y is not None:
+            self.y = torch.LongTensor(y)
+
+    def __len__(self):
+        return len(self.x)
+
+    def __getitem__(self, index):
+        X = self.x[index]
+        if self.y is not None:
+            Y = self.y[index]
+            return X, Y
+        else:
+            return X
+
+torch.manual_seed(2)
+trainX, trainY = get(X=trainX,Y=trainY,maxlen=maxlen)
+checkX, checkY = get(X=checkX,Y=checkY,maxlen=maxlen)
+testX, testY = get(X=testX,Y=testY,maxlen=maxlen)
+train_set = Sentence(trainX, trainY)
+check_set = Sentence(checkX, checkY)
+test_set = Sentence(testX, testY)
+train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=4)  # shuffle表示是否在每个epoch开始的时候，对数据进行重新排序
+check_loader = DataLoader(check_set, batch_size=batch_size, shuffle=True, num_workers=4)  # shuffle表示是否在每个epoch开始的时候，对数据进行重新排序
+test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=4)
+device=torch.device('cuda:0')
+
+class LSTM_CRF(nn.Module):
+    def __init__(self, dict_size, emb_dim, seq_len,tag_size,hidden_size,batch_size):#字典大小，em维度，句子长度，类别大小，LSTM隐向量维度
+        #每一个句子被=[单词个数，em维度]
+        super(LSTM_CRF, self).__init__()
+        self.dict_size = dict_size
+        self.emb_dim = emb_dim
+        self.tag_size = tag_size
+        self.embedding = nn.Embedding(dict_size, embedding_dim)
+        self.embedding.weight.data.copy_(torch.LongTensor(glove.word_vectors.tolist()))
+        self.hidden_size = hidden_size
+        self.lstm = nn.LSTM(self.emb_dim, self.hidden_size, batch_first=True, bidirectional=True)
+        self.fc = nn.ModuleList()
+        for i in range(batch_size):
+            self.fc.append(nn.Linear(self.hidden_size*2, self.tag_size))
+        self.tr = nn.Parameter(torch.randn(self.tag_size, self.tag_size))
+        #X[:,0]就是取矩阵X的所有行的第0列的元素
+        #其他地方不能到start
+        self.tr.data[:, START] = -10000
+        #end不能去其他地方
+        self.tr.data[END, :] = -10000
+    #用来预测最优解
+    def solve(self, score):
+        # score: seq_len * tag_size
+
+        in_time1 = time.time()
+        seq_len = score.size(0)
+        dp = [[-10000.] * self.tag_size for _ in range(seq_len)]
+        pre = [[0] * self.tag_size for _ in range(seq_len)]
+        Tr = self.tr.tolist()
+        Score = score.tolist()
+        in_time2 = time.time()
+        # print(Score.shape)
+        # print(self.tag_size)
+        # dp[i][j] 表示 在i这个位置上，选择tag j的分是多少
+        for i in range(seq_len):
+            for j in range(self.tag_size):  # 枚举之前的tag是谁
+                if i == 0 and j != 0:
+                    continue
+                for k in range(self.tag_size):  # 枚举当前的tag
+                    if i == 0:
+                        if Tr[j][k] + Score[i][k] > dp[i][k]:
+                            dp[i][k] = Tr[j][k] + Score[i][k]
+                            pre[i][k] = j
+                    else:
+                        if dp[i - 1][j] + Tr[j][k] + Score[i][k] > dp[i][k]:
+                            dp[i][k] = dp[i - 1][j] + Tr[j][k] + Score[i][k]
+                            pre[i][k] = j
+        in_time3 = time.time()
+        # print("time: ",in_time3-in_time2)
+        maxans = -10000
+        ch = 0
+        path = []
+        for j in range(self.tag_size):
+            if dp[seq_len - 1][j] + Tr[j][END] > maxans:
+                maxans = dp[seq_len - 1][j] + Tr[j][END]
+                ch = j
+        cnt = seq_len
+        while cnt != 0:
+            cnt -= 1
+            path.append(ch)
+            ch = pre[cnt][ch]
+        path.reverse()
+        return maxans, path
+
+    #用来跑神经网络，并对预测以及更新进行处理
+    def get(self, inputs,flag,real=None):
+        batch_size = inputs.size(0)
+        seq_len = inputs.size(1)
+        # emb: batch_size * seq_len * emb_dim
+        emb = self.embedding(inputs)
+        # lstm_out: batch_size * seq_len * hidden_size*2
+        lstm_out, _ = self.lstm(emb)
+        # score: batch_size * seq_len * tag_size 这个的作用就是求得每个位置的不同tag的得分
+        # 设置为float
+        score = torch.zeros((batch_size, seq_len, self.tag_size),).float().cuda()
+        # print("batch_size: ",batch_size,"seq_len: ",seq_len,"tag_size: ",self.tag_size)
+        # print(lstm_out[0].shape)
+        #print(lstm_out[0].shape)
+        
+        for i in range(batch_size):
+            score[i] = self.fc[i](lstm_out[i])
+        if flag == 1:
+            Tr = self.tr.cpu()
+            Score = score.cpu()
+            ans = torch.zeros(batch_size).float()
+            for i in range(batch_size):
+                for j in range(seq_len):
+                    ans[i] += Score[i][j][real[i][j]]  # BILSTM得分
+                    if j != 0:
+                        ans[i] += Tr[real[i][j-1]][real[i][j]]  # 转移分数
+                    else:
+                        ans[i] += Tr[START][real[i][j]]  # 开局从start转移过来
+                ans[i] += Tr[real[i][seq_len-1]][END]  # 到end
+            return ans.cuda(), score
+
+        # ans: batch_size
+        ans = torch.zeros(batch_size).float().cuda()
+        # path: batch_size * seq_len
+        path = []
+        for i in range(batch_size):
+            t1, t2 = self.solve(score[i])
+            ans[i] = t1
+            path.append(t2)
+        return ans, path
+
+    def log_sum_exp(self, vec):
+        # print("vec: ", vec.shape)
+        # print(vec)
+        max_score = vec.max()
+        #print(max_score)
+        # print("max_score: ", max_score.shape)
+        #print(max_score," ",max_score.item())
+        max_score_broadcast = max_score.expand(vec.size(0),)
+        return max_score + torch.log(torch.sum(torch.exp(vec - max_score_broadcast)))
+
+    def log_sum_exp2(self, vec):
+        # vec: tag_size * tag_size
+        # print("vec: ", vec.shape)
+        #print(vec)
+        max_score , max_index = torch.max(vec,dim=1)
+        #print(vec.shape)
+        #print(max_score)
+        # print("max_score: ", max_score.shape)
+        #print(max_score," ",max_score.item())
+        max_score_broadcast = max_score.unsqueeze(-1).expand(vec.size(0),vec.size(1))
+        return max_score + torch.log(torch.sum(torch.exp(vec - max_score_broadcast),dim=1))
+
+    # 计算路径答案总和
+    def path_sum(self, score):
+        previous = torch.full((self.tag_size,), -10000.).cuda()
+        previous[START]=0
+        seq_len = score.size(0)
+        # 考虑i为0时候特判
+        for i in range(seq_len):
+            obs = score[i]  # tag_size
+            
+            #print(previous.expand(self.tag_size, self.tag_size).transpose(0,1))
+            # print(previous)
+            # print(obs)
+            sum = obs.expand(self.tag_size,self.tag_size) + previous.expand(self.tag_size,self.tag_size).transpose(0,1) + self.tr
+            #print(sum)
+            #求和是纵向求和
+            sum = sum.transpose(0,1)
+            #for j in range(self.tag_size):
+                #previous[j] = self.log_sum_exp(sum[j])
+            previous = self.log_sum_exp2(sum)
+            # print(previous)
+        previous += self.tr.transpose(0,1)[END]
+        all = self.log_sum_exp(previous)
+        return all
+
+    # 这次是在输出答案的时候才会用了，其他时候都是用calu
+    def forward(self, inputs):
+        return self.get(inputs,0)
+
+    def calu(self, inputs):
+        ans, score = self.get(inputs[0],1,inputs[1])
+        batch_size = score.size(0)
+        sum = torch.zeros(batch_size).float().cuda()
+        for i in range(batch_size):
+            sum[i] = self.path_sum(score[i])
+        #print(self.tr.data)
+        #print(ans," ",sum)
+        return -(ans.sum() - sum.sum())
+
+model = LSTM_CRF(dict_size,embedding_dim,maxlen,tag_size,hidden_size,batch_size).cuda()
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+num_epoch = 100
+for epoch in range(num_epoch):
+    model.train()
+    cnt = 0
+
+    for i, data in enumerate(train_loader):
+        start = time.time()
+        optimizer.zero_grad()
+        #print(data[0])
+        loss = model.calu((data[0].cuda(),data[1]))
+        mid = time.time()
+        loss.backward()  # 利用 back propagation 算出每个参数的 gradient
+        mid2 = time.time()
+        optimizer.step()  # 以 optimizer 用 gradient 更新参数
+        #print(mid-start,mid2-mid,time.time()-mid2)
+    model.eval()
+    with torch.no_grad():
+        '''for i, data in enumerate(check_loader):
+            check_pred = model(data[0].cuda())
+            check_acc += np.sum(np.argmax(check_pred.cpu().data.numpy(), axis=1) == data[1].numpy())'''
+        sum = 0
+        acc = 0
+        y_true = []
+        y_pred = []
+        for i, data in enumerate(test_loader):
+            ans, path = model(data[0].cuda())
+            for x in range(len(data[1])):  # 枚举batch
+                tmp  = data[1][x].tolist()
+                for j in range(len(tmp)):  # 枚举的是tag
+                    if tmp[j] != 2:
+                        if tmp[j] > 2:
+                          y_true.append(tmp[j]-1)
+                          y_pred.append(path[x][j]-1)
+                        else:
+                          y_true.append(tmp[j])
+                          y_pred.append(path[x][j])
+        print("acc: ", precision_score(y_true, y_pred, average='weighted',zero_division=1)," ",1.0*np.sum(np.array(y_true)==np.array(y_pred))/len(y_pred)  )
+
+    #print(epoch, " ", train_acc/len(train_set)," ",check_acc/len(check_set)," ",test_acc/len(test_set))
